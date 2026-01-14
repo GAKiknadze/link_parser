@@ -12,6 +12,8 @@ import signal
 import sys
 from dataclasses import dataclass
 from typing import List, Dict, Optional, Set
+from tqdm import tqdm
+from tqdm.asyncio import tqdm as async_tqdm
 
 @dataclass
 class LinkInfo:
@@ -70,40 +72,51 @@ def setup_selenium_driver():
     return driver
 
 def get_links_with_selenium(url: str) -> List[LinkInfo]:
-    """Получение ссылок с использованием Selenium с оптимизацией скорости"""
+    """Получение ВСЕХ ссылок с использованием Selenium с прогресс-баром"""
     driver = setup_selenium_driver()
     links = []
     seen_urls: Set[str] = set()
     
     try:
-        print(f"🌐 Загрузка страницы: {url}")
+        print(f"\n{'='*60}")
+        print(f"🌐 ЗАГРУЗКА СТРАНИЦЫ: {url}")
+        print(f"{'='*60}")
         start_time = time.time()
         
         # Устанавливаем короткий таймаут загрузки страницы
-        driver.set_page_load_timeout(15)
+        driver.set_page_load_timeout(20)
         driver.get(url)
         
         # Ждем минимальной загрузки DOM
-        WebDriverWait(driver, 5).until(
+        WebDriverWait(driver, 8).until(
             EC.presence_of_element_located((By.TAG_NAME, 'body'))
         )
         
         # Прокручиваем страницу для загрузки динамического контента
         driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-        time.sleep(0.5)
+        time.sleep(1)
+        
+        # Дополнительная прокрутка для SPA
+        for _ in range(3):
+            driver.execute_script("window.scrollBy(0, 500);")
+            time.sleep(0.3)
         
         # Собираем ссылки
         a_tags = driver.find_elements(By.TAG_NAME, 'a')
         base_url = driver.current_url
         domain = urlparse(base_url).netloc
         
-        for a in a_tags:
+        print(f"\n🔗 СБОР ССЫЛОК СО СТРАНИЦЫ...")
+        print(f"{'-'*60}")
+        
+        # Прогресс-бар для сбора ссылок
+        for a in tqdm(a_tags, desc="Парсинг ссылок", unit="ссылка", dynamic_ncols=True):
             try:
                 href = a.get_attribute('href')
                 text = a.text.strip()
                 
                 # Фильтрация нерелевантных ссылок
-                if not href or href.startswith(('javascript:', 'mailto:', 'tel:', 'file:', 'data:', '#', 'about:')):
+                if not href or href.startswith(('javascript:', 'mailto:', 'tel:', 'file:', '#', 'about:', 'data:')):
                     continue
                 
                 # Нормализация URL
@@ -115,33 +128,32 @@ def get_links_with_selenium(url: str) -> List[LinkInfo]:
                 ).geturl()
                 
                 # Проверка на уникальность
-                if normalized_url in seen_urls or len(normalized_url) > 2048:
+                if normalized_url in seen_urls or len(normalized_url) > 4096:
                     continue
                 seen_urls.add(normalized_url)
                 
-                # Ограничиваем текст для экономии памяти
-                display_text = text[:100] + "..." if len(text) > 100 else text
+                # Ограничиваем текст для читаемости
+                display_text = text[:100].replace('\n', ' ').replace('\r', ' ') + ("..." if len(text) > 100 else "")
                 
                 links.append(LinkInfo(
                     text=display_text if display_text else normalized_url[:50],
                     url=normalized_url,
                     domain=parsed.netloc or domain
                 ))
-            except:
-                continue
+            except Exception as e:
+                continue  # Пропускаем проблемные элементы
         
         elapsed = time.time() - start_time
-        print(f"✅ Найдено {len(links)} уникальных ссылок за {elapsed:.2f} сек")
+        print(f"\n✅ Найдено {len(links)} уникальных ссылок за {elapsed:.2f} сек")
         
     except Exception as e:
         print(f"❌ Ошибка при получении ссылок: {str(e)}")
     finally:
         driver.quit()
     
-    # Ограничиваем количество для скорости проверки
-    return links[:200]
+    return links
 
-async def check_url_status(session: aiohttp.ClientSession, url: str, timeout: float = 2.0) -> Dict:
+async def check_url_status(session: aiohttp.ClientSession, url: str, timeout: float = 3.0) -> Dict:
     """Максимально быстрая проверка статуса с использованием HEAD запросов"""
     start_time = time.time()
     result = {
@@ -158,7 +170,7 @@ async def check_url_status(session: aiohttp.ClientSession, url: str, timeout: fl
             async with session.head(
                 url,
                 allow_redirects=True,
-                timeout=ClientTimeout(total=timeout, sock_read=1.0),
+                timeout=ClientTimeout(total=timeout, sock_read=1.5),
                 headers={
                     'Connection': 'close',
                     'Accept': '*/*',
@@ -184,7 +196,7 @@ async def check_url_status(session: aiohttp.ClientSession, url: str, timeout: fl
         async with session.get(
             url,
             allow_redirects=True,
-            timeout=ClientTimeout(total=timeout, sock_read=1.5),
+            timeout=ClientTimeout(total=timeout, sock_read=2.0),
             headers={
                 'Connection': 'close',
                 'Accept': 'text/html,application/xhtml+xml;q=0.9',
@@ -213,8 +225,15 @@ async def check_url_status(session: aiohttp.ClientSession, url: str, timeout: fl
     result['response_time'] = time.time() - start_time
     return result
 
-async def check_links_ultra_fast(links: List[LinkInfo]) -> List[LinkInfo]:
-    """Ультра-быстрая проверка всех ссылок с максимальной оптимизацией"""
+async def check_links_ultra_fast(links: List[LinkInfo], max_connections: int = 200) -> List[LinkInfo]:
+    """Ультра-быстрая проверка ВСЕХ ссылок с прогресс-баром"""
+    print(f"\n{'='*60}")
+    print(f"⚡ ПРОВЕРКА СТАТУСОВ {len(links)} ССЫЛОК")
+    print(f"{'='*60}")
+    print("Стратегия: HEAD запросы → GET с ограничением → таймауты 3с")
+    print(f"Параметры: {max_connections} соединений, 20/домен")
+    print("-"*60)
+    
     # Группируем по доменам для балансировки
     domain_groups = {}
     for idx, link in enumerate(links):
@@ -223,14 +242,14 @@ async def check_links_ultra_fast(links: List[LinkInfo]) -> List[LinkInfo]:
         domain_groups[link.domain].append((idx, link))
     
     connector = TCPConnector(
-        limit=100,           # Общий лимит соединений
-        limit_per_host=15,   # Лимит на домен
+        limit=max_connections,    # Общий лимит соединений
+        limit_per_host=20,        # Лимит на домен
         enable_cleanup_closed=True,
         force_close=True,
-        ssl=False            # Отключаем SSL для скорости
+        ssl=False                 # Отключаем SSL для скорости
     )
     
-    timeout = ClientTimeout(total=3.0, connect=1.0)
+    timeout = ClientTimeout(total=5.0, connect=2.0)
     
     async with aiohttp.ClientSession(
         connector=connector,
@@ -243,11 +262,15 @@ async def check_links_ultra_fast(links: List[LinkInfo]) -> List[LinkInfo]:
         trust_env=False
     ) as session:
         
+        # Общее количество задач для прогресс-бара
+        total_tasks = len(links)
+        pbar = tqdm(total=total_tasks, desc="Проверка статусов", unit="ссылка", dynamic_ncols=True)
+        
         async def process_domain(domain, items):
             results = []
-            # Обрабатываем по 15 ссылок за раз для каждого домена
-            for i in range(0, len(items), 15):
-                batch = items[i:i+15]
+            # Обрабатываем по 20 ссылок за раз для каждого домена
+            for i in range(0, len(items), 20):
+                batch = items[i:i+20]
                 tasks = [check_url_status(session, link.url) for _, link in batch]
                 batch_results = await asyncio.gather(*tasks, return_exceptions=True)
                 
@@ -262,20 +285,29 @@ async def check_links_ultra_fast(links: List[LinkInfo]) -> List[LinkInfo]:
                     link.error = result.get('error')
                     link.response_time = result.get('response_time', 0.0)
                     results.append(link)
+                    pbar.update(1)  # Обновляем прогресс
                 
                 # Короткая пауза между пакетами для одного домена
-                await asyncio.sleep(0.01)
+                await asyncio.sleep(0.02)
             return results
         
         # Запускаем проверку для всех доменов параллельно
         domain_tasks = [process_domain(domain, items) for domain, items in domain_groups.items()]
-        domain_results = await asyncio.gather(*domain_tasks)
+        
+        try:
+            domain_results = await async_tqdm.gather(*domain_tasks, desc="Домены", unit="домен")
+        except asyncio.CancelledError:
+            print("\n\n⚠️ Проверка прервана пользователем")
+            pbar.close()
+            raise
+        
+        pbar.close()
         
         # Собираем результаты в исходном порядке
         all_results = [None] * len(links)
         for domain_result in domain_results:
             for link in domain_result:
-                # Находим исходный индекс (грубый метод, но быстрый)
+                # Находим исходный индекс
                 for i, orig_link in enumerate(links):
                     if orig_link.url == link.url and all_results[i] is None:
                         all_results[i] = link
@@ -284,59 +316,130 @@ async def check_links_ultra_fast(links: List[LinkInfo]) -> List[LinkInfo]:
         return [link for link in all_results if link is not None]
 
 def report_results(links: List[LinkInfo]):
-    """Вывод результатов в оптимизированном формате"""
+    """Вывод результатов с прогресс-баром и детальной статистикой"""
     valid = [l for l in links if l.is_valid]
     invalid = [l for l in links if not l.is_valid]
     
     print(f"\n{'='*60}")
-    print(f"✅ ВАЛИДНЫЕ ССЫЛКИ (200-399): {len(valid)}")
+    print(f"✅ ВАЛИДНЫЕ ССЫЛКИ (200-399): {len(valid)} из {len(links)}")
     print(f"{'-'*60}")
-    for i, link in enumerate(valid[:10], 1):  # Показываем только первые 10
-        print(f"{i}. {link.text[:50]}")
-        print(f"   → {link.url[:70]}")
-        print(f"   📊 {link.status_code} | ⏱️ {link.response_time:.3f}с\n")
     
-    if len(valid) > 10:
-        print(f"... и еще {len(valid) - 10} валидных ссылок")
+    # Показываем топ-20 валидных ссылок
+    for i, link in enumerate(valid[:20], 1):
+        status_color = "\033[92m" if link.is_valid else "\033[91m"
+        time_color = "\033[94m" if link.response_time < 1.0 else "\033[93m" if link.response_time < 2.0 else "\033[91m"
+        reset = "\033[0m"
+        
+        print(f"{i}. {link.text[:70]}")
+        print(f"   → {link.url[:80]}")
+        print(f"   📊 {status_color}{link.status_code}{reset} | ⏱️ {time_color}{link.response_time:.3f}с{reset}\n")
+    
+    if len(valid) > 20:
+        print(f"... и еще {len(valid) - 20} валидных ссылок")
     
     print(f"\n{'='*60}")
-    print(f"❌ НЕВАЛИДНЫЕ ССЫЛКИ: {len(invalid)}")
+    print(f"❌ НЕВАЛИДНЫЕ ССЫЛКИ: {len(invalid)} из {len(links)}")
     print(f"{'-'*60}")
-    for i, link in enumerate(invalid[:10], 1):  # Показываем только первые 10
-        status = link.status_code if link.status_code else "ERR"
-        error = f" | {link.error}" if link.error else ""
-        print(f"{i}. {link.text[:50]}")
-        print(f"   → {link.url[:70]}")
-        print(f"   📊 {status}{error}")
-        print(f"   ⏱️ {link.response_time:.3f}с\n")
     
-    if len(invalid) > 10:
-        print(f"... и еще {len(invalid) - 10} невалидных ссылок")
+    # Показываем топ-20 невалидных ссылок
+    for i, link in enumerate(invalid[:20], 1):
+        status = link.status_code if link.status_code else "ERR"
+        error = f" | {link.error[:50]}" if link.error else ""
+        status_color = "\033[92m" if link.is_valid else "\033[91m"
+        time_color = "\033[94m" if link.response_time < 1.0 else "\033[93m" if link.response_time < 2.0 else "\033[91m"
+        reset = "\033[0m"
+        
+        print(f"{i}. {link.text[:70]}")
+        print(f"   → {link.url[:80]}")
+        print(f"   📊 {status_color}{status}{reset}{error}")
+        print(f"   ⏱️ {time_color}{link.response_time:.3f}с{reset}\n")
+    
+    if len(invalid) > 20:
+        print(f"... и еще {len(invalid) - 20} невалидных ссылок")
+    
+    # Детальная статистика
+    print(f"\n{'='*60}")
+    print("📊 ДЕТАЛЬНАЯ СТАТИСТИКА")
+    print(f"{'='*60}")
+    
+    # Статистика по статус-кодам
+    status_counts = {}
+    for link in links:
+        status = link.status_code or "ERROR"
+        status_counts[status] = status_counts.get(status, 0) + 1
+    
+    print("Статус-коды:")
+    for status, count in sorted(status_counts.items(), key=lambda x: x[1], reverse=True):
+        percentage = (count / len(links)) * 100
+        print(f"  {status}: {count} ({percentage:.1f}%)")
+    
+    # Статистика по доменам
+    domain_stats = {}
+    for link in links:
+        domain = link.domain or "unknown"
+        if domain not in domain_stats:
+            domain_stats[domain] = {'total': 0, 'valid': 0}
+        domain_stats[domain]['total'] += 1
+        if link.is_valid:
+            domain_stats[domain]['valid'] += 1
+    
+    print(f"\nТоп-5 доменов:")
+    top_domains = sorted(domain_stats.items(), key=lambda x: x[1]['total'], reverse=True)[:5]
+    for domain, stats in top_domains:
+        valid_percent = (stats['valid'] / stats['total']) * 100
+        print(f"  {domain}: {stats['total']} ссылок | Валидных: {stats['valid']} ({valid_percent:.1f}%)")
     
     # Сохранение полных результатов
+    print(f"\n{'='*60}")
+    print("💾 СОХРАНЕНИЕ РЕЗУЛЬТАТОВ")
+    print(f"{'='*60}")
+    
     with open('valid_links.txt', 'w', encoding='utf-8') as f:
-        for link in valid:
+        for link in tqdm(valid, desc="Сохранение валидных", unit="ссылка"):
             f.write(f"{link.text} | {link.url} | {link.status_code} | {link.response_time:.3f}\n")
     
     with open('invalid_links.txt', 'w', encoding='utf-8') as f:
-        for link in invalid:
+        for link in tqdm(invalid, desc="Сохранение невалидных", unit="ссылка"):
             status = link.status_code or "ERR"
             error = link.error or ""
             f.write(f"{link.text} | {link.url} | {status} | {error} | {link.response_time:.3f}\n")
     
-    print(f"\n✅ Полные результаты сохранены в:")
-    print(f"   - valid_links.txt ({len(valid)} ссылок)")
-    print(f"   - invalid_links.txt ({len(invalid)} ссылок)")
+    # JSON отчет
+    import json
+    report = {
+        'summary': {
+            'total_links': len(links),
+            'valid_links': len(valid),
+            'invalid_links': len(invalid),
+            'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+            'avg_response_time': sum(l.response_time for l in links) / len(links) if links else 0
+        },
+        'links': [l.__dict__ for l in links]
+    }
+    
+    with open('full_report.json', 'w', encoding='utf-8') as f:
+        json.dump(report, f, ensure_ascii=False, indent=2)
+    
+    print(f"\n✅ Отчеты сохранены:")
+    print(f"   • valid_links.txt ({len(valid)} ссылок)")
+    print(f"   • invalid_links.txt ({len(invalid)} ссылок)")
+    print(f"   • full_report.json (полные данные)")
 
-async def main(url: str):
-    """Основной процесс с максимальной оптимизацией скорости"""
-    signal.signal(signal.SIGINT, lambda s, f: sys.exit(0))
+async def main(url: str, max_connections: int = 200):
+    """Основной процесс с прогресс-баром для всех этапов"""
+    # Обработчик прерываний
+    def signal_handler(sig, frame):
+        print("\n\n⚠️ Получен сигнал прерывания. Завершаем...")
+        sys.exit(0)
+    
+    signal.signal(signal.SIGINT, signal_handler)
     
     print("="*60)
-    print("🚀 СВЕРХБЫСТРАЯ ПРОВЕРКА ССЫЛОК С ИСПОЛЬЗОВАНИЕМ SELENIUM")
+    print("🚀 СВЕРХБЫСТРАЯ ПРОВЕРКА ССЫЛОК С SELENIUM И ПРОГРЕСС-БАРОМ")
     print("="*60)
     print(f"🎯 Целевой URL: {url}")
-    print(f"⚡ Стратегия: Selenium для сбора + HEAD запросы для проверки")
+    print(f"⚡ Макс соединений: {max_connections}")
+    print(f"📈 Нет ограничений на количество ссылок")
     print("-"*60)
     
     total_start = time.time()
@@ -348,10 +451,13 @@ async def main(url: str):
         return
     
     # Этап 2: Сверхбыстрая проверка статусов
-    print(f"\n⚡ Запуск ультра-быстрой проверки {len(links)} ссылок...")
     check_start = time.time()
     
-    checked_links = await check_links_ultra_fast(links)
+    try:
+        checked_links = await check_links_ultra_fast(links, max_connections)
+    except asyncio.CancelledError:
+        print("❗ Проверка была прервана")
+        return
     
     check_time = time.time() - check_start
     total_time = time.time() - total_start
@@ -363,12 +469,26 @@ async def main(url: str):
     print(f"🏁 Общее время: {total_time:.2f} сек")
     
     report_results(checked_links)
+    
+    print(f"\n{'='*60}")
+    print(f"🎉 ПРОВЕРКА ЗАВЕРШЕНА УСПЕШНО!")
+    print(f"{'='*60}")
 
 if __name__ == "__main__":
     import argparse
     
-    parser = argparse.ArgumentParser(description='Сверхбыстрая проверка ссылок с использованием Selenium')
+    parser = argparse.ArgumentParser(description='Сверхбыстрая проверка ссылок с прогресс-баром')
     parser.add_argument('url', type=str, help='URL для анализа')
+    parser.add_argument('--connections', type=int, default=200, help='Максимальное количество соединений (по умолчанию: 200)')
     args = parser.parse_args()
     
-    asyncio.run(main(args.url))
+    # Проверка наличия ChromeDriver
+    try:
+        from selenium import webdriver
+    except ImportError:
+        print("❌ Ошибка: не установлен selenium")
+        print("Установите зависимости: pip install selenium aiohttp tqdm webdriver-manager")
+        sys.exit(1)
+    
+    # Запуск основного процесса
+    asyncio.run(main(args.url, args.connections))
